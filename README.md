@@ -13,8 +13,11 @@ No OpenAI API keys. No cloud services. Everything runs on your machine.
 - **Contextual Retrieval** — every chunk is enriched with a situating context sentence before embedding, reducing retrieval failures by ~49% ([Anthropic, 2024](https://www.anthropic.com/news/contextual-retrieval))
 - **Hybrid retrieval** — dense vector search (ChromaDB + nomic-embed-text) fused with BM25 sparse search via Reciprocal Rank Fusion (RRF)
 - **Optional cross-encoder reranking** — a second-stage `BAAI/bge-reranker-v2-m3` re-scores fused candidates for relevance, typically lifting top-1 precision by ~5–15%
+- **Multi-turn conversational retrieval** — follow-up questions with pronouns ("how does that compare to Q2?") are rewritten into self-contained search queries against the chat history before retrieval
+- **Cross-file numbered citations** — answers cite each claim with `[1]`, `[2]`, … pointing at a numbered source list, so attribution stays clear even when the response stitches together facts from multiple files
+- **Metadata filtering in the UI** — restrict retrieval by **modality** (Document / Audio / Image / Video / Code), **source file**, or **indexed-date range** directly from the sidebar
 - **Fully local LLMs** — Llama 3 for chunking, context generation, and answering; LLaVA for image understanding; Whisper for transcription
-- **Streamlit chat UI** — chat interface with source attribution and RRF score display
+- **Streamlit chat UI** — chat interface with source attribution, chunk snippets, and per-source RRF / rerank scores
 - **Persistent indexes** — ChromaDB and BM25 survive restarts; re-indexing a file automatically deduplicates
 
 ---
@@ -233,6 +236,23 @@ In this project the contextualisation calls run in parallel via `ThreadPoolExecu
 
 ---
 
+## 🗂️ Metadata Filtering & Cross-File Citations
+
+Every chunk is stored with structured metadata: `source` (filename), `modality`, `summary`, `keywords`, `context`, `indexed_at` (ISO string), and `indexed_ts` (Unix int for range queries).
+
+**Filtering** happens at query time. The sidebar exposes three filters that are combined into a single ChromaDB `where` clause and applied to both retrieval stages:
+
+| Filter | Backend behaviour |
+|--------|-------------------|
+| **Modality** (multi-select) | `{"modality": {"$in": [...]}}` — dense retrieval filters natively; BM25 results are post-filtered via `ChromaStore.filter_ids` since rank_bm25 is metadata-blind. |
+| **Source file** (multi-select) | `{"source": {"$in": [...]}}` — same path. |
+| **Indexed date range** | `{"indexed_ts": {"$gte": …, "$lte": …}}` — exact range query over the integer timestamp stored at ingest. |
+
+When more than one constraint is active they are combined with `$and`. Sparse retrieval over-retrieves (`top_k × 4`) when a filter is active so the surviving set is still rich enough for RRF + reranking.
+
+**Citations** were upgraded for multi-file scenarios. The LLM no longer writes `[Source: filename]` inline; instead it cites each claim with `[1]`, `[2]`, … matching a numbered source list rendered in the UI. The system prompt explicitly tells the model to **not blend facts across files** — every numbered claim must come from the chunk with that number. The "Sources used" panel shows how many chunks came from how many distinct files, with a short snippet of each chunk so attribution is verifiable.
+
+---
 ## 🎯 How Reranking Works
 
 RRF fusion ranks results by their *position* in the dense and sparse result lists — it never directly measures how well a chunk answers the query. This can promote chunks that merely share keywords over chunks that actually contain the answer.
@@ -289,6 +309,7 @@ sentence-transformers  # Cross-encoder reranker (optional)
 - [x] Metadata filtering in the UI (by modality, date, source)
 - [ ] Support for web URL ingestion
 - [ ] Docker Compose setup for one-command deployment
+- [ ] Page-number / timestamp granularity in citations (PDF pages, video timestamps)
 
 ---
 

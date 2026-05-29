@@ -1372,6 +1372,13 @@ class MultimodalRAGPipeline:
         # Step 3: Agentic chunking → list of ChunkDicts
         chunks = self._chunker.chunk(unified)
 
+        # Attach the file's source name and detected modality to every chunk.
+        # The ChunkingAgent's LLM output only contains chunk_text/summary/keywords;
+        # downstream metadata filters need these fields to live on the dict itself.
+        for chunk in chunks:
+            chunk["source"]   = path.name
+            chunk["modality"] = modality
+
         # Step 4: Contextual retrieval enrichment (optional, default ON)
         # The full unified document is passed so the LLM can situate every
         # chunk in relation to the whole — this is the key to the technique.

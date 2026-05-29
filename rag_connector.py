@@ -97,6 +97,7 @@ import logging
 import math
 import re
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -412,12 +413,16 @@ class ChromaStore:
         """
         # ChromaDB metadata values must be str | int | float | bool.
         # Convert lists (keywords) to comma-separated strings.
+        # indexed_at is ISO-8601 for display; indexed_ts is a Unix int for
+        # range filtering (ChromaDB's $gte / $lte work numerically on ints).
         metadata = {
-            "source"   : str(chunk.get("source", "")),
-            "modality" : str(chunk.get("modality", "")),
-            "summary"  : str(chunk.get("summary", "")),
-            "keywords" : ", ".join(chunk.get("keywords", [])),
-            "context"  : str(chunk.get("context", "")),
+            "source"     : str(chunk.get("source", "")),
+            "modality"   : str(chunk.get("modality", "")),
+            "summary"    : str(chunk.get("summary", "")),
+            "keywords"   : ", ".join(chunk.get("keywords", [])),
+            "context"    : str(chunk.get("context", "")),
+            "indexed_at" : str(chunk.get("indexed_at", "")),
+            "indexed_ts" : int(chunk.get("indexed_ts", 0)),
         }
 
         self._collection.upsert(
@@ -436,11 +441,13 @@ class ChromaStore:
         """Batch upsert — much faster than looping upsert() for many chunks."""
         metadatas = [
             {
-                "source"   : str(c.get("source", "")),
-                "modality" : str(c.get("modality", "")),
-                "summary"  : str(c.get("summary", "")),
-                "keywords" : ", ".join(c.get("keywords", [])),
-                "context"  : str(c.get("context", "")),
+                "source"     : str(c.get("source", "")),
+                "modality"   : str(c.get("modality", "")),
+                "summary"    : str(c.get("summary", "")),
+                "keywords"   : ", ".join(c.get("keywords", [])),
+                "context"    : str(c.get("context", "")),
+                "indexed_at" : str(c.get("indexed_at", "")),
+                "indexed_ts" : int(c.get("indexed_ts", 0)),
             }
             for c in chunks
         ]
@@ -515,6 +522,35 @@ class ChromaStore:
                 "metadata": result["metadatas"][0],
             }
         return None
+
+    def filter_ids(self, ids: list[str], where: dict | None) -> list[str]:
+        """
+        Return the subset of *ids* whose stored metadata matches *where*.
+
+        Used to apply metadata filters to BM25 (sparse) results, since BM25
+        itself is metadata-blind. Dense retrieval already filters natively
+        via ChromaDB's `where` parameter.
+        """
+        if not ids or not where:
+            return ids
+        result = self._collection.get(ids=ids, where=where, include=[])
+        return result.get("ids", [])
+
+    def list_distinct(self, field: str) -> list[str]:
+        """
+        Return the sorted list of distinct values stored for a metadata field.
+
+        Used to populate the UI's filter dropdowns (sources, modalities).
+        ChromaDB has no native DISTINCT, so we fetch all metadata and
+        deduplicate in Python — fine for indexes up to ~10⁵ chunks.
+        """
+        result = self._collection.get(include=["metadatas"])
+        values: set[str] = set()
+        for meta in result.get("metadatas", []) or []:
+            v = meta.get(field)
+            if v:
+                values.add(str(v))
+        return sorted(values)
 
     # ── Delete ────────────────────────────────────────────────────────────────
 
@@ -920,9 +956,13 @@ You are a precise, factual assistant answering questions based ONLY on the \
 provided source chunks. Follow these rules:
 1. Base your answer SOLELY on the provided chunks. Do not use prior knowledge.
 2. If the chunks do not contain enough information, say so explicitly.
-3. Cite the source of each claim using the format [Source: filename].
-4. Be concise but complete. Use bullet points for multi-part answers.
-5. Never fabricate facts, dates, names, or numbers."""
+3. Cite EVERY claim with bracketed source numbers matching the chunk list,
+   e.g. "Revenue grew 18% [1]." Combine multiple sources as [1, 3] when a
+   claim is supported by more than one chunk.
+4. When chunks come from DIFFERENT source files, attribute each claim to its
+   correct source — do not blend facts across files.
+5. Be concise but complete. Use bullet points for multi-part answers.
+6. Never fabricate facts, dates, names, or numbers."""
 
     def __init__(
         self,
@@ -1022,9 +1062,16 @@ provided source chunks. Follow these rules:
             logger.warning("[RAGConnector] Pipeline returned 0 chunks for '%s'.", path.name)
             return 0
 
-        # Attach source filename to each chunk for metadata storage
+        # Attach source filename and ingestion timestamps to each chunk.
+        # indexed_at (ISO) is for display; indexed_ts (Unix int) is what the
+        # UI date-range filter uses with ChromaDB's $gte/$lte operators.
+        now    = datetime.now(tz=timezone.utc)
+        iso_ts = now.isoformat(timespec="seconds")
+        unix_ts = int(now.timestamp())
         for chunk in chunks:
             chunk.setdefault("source", path.name)
+            chunk["indexed_at"] = iso_ts
+            chunk["indexed_ts"] = unix_ts
 
         # ── Step 3: Embed all contextualized_text strings ─────────────────
         logger.info("[RAGConnector] Embedding %d chunks…", len(chunks))
@@ -1066,11 +1113,56 @@ provided source chunks. Follow these rules:
 
     # ── QUERYING ──────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _build_where_filter(
+        modality_filter : str | list[str] | None = None,
+        source_filter   : str | list[str] | None = None,
+        date_from_ts    : int | None = None,
+        date_to_ts      : int | None = None,
+    ) -> dict | None:
+        """
+        Build a ChromaDB-compatible `where` clause from independent filter inputs.
+
+        ChromaDB requires a top-level `$and` when combining multiple constraints.
+        Single-constraint filters are returned as a plain dict for clarity.
+        """
+        clauses: list[dict] = []
+
+        def _as_clause(field: str, value: str | list[str]) -> dict:
+            if isinstance(value, list):
+                value = [v for v in value if v]
+                if not value:
+                    return {}
+                if len(value) == 1:
+                    return {field: value[0]}
+                return {field: {"$in": value}}
+            return {field: value}
+
+        if modality_filter:
+            c = _as_clause("modality", modality_filter)
+            if c: clauses.append(c)
+        if source_filter:
+            c = _as_clause("source", source_filter)
+            if c: clauses.append(c)
+        if date_from_ts is not None:
+            clauses.append({"indexed_ts": {"$gte": int(date_from_ts)}})
+        if date_to_ts is not None:
+            clauses.append({"indexed_ts": {"$lte": int(date_to_ts)}})
+
+        if not clauses:
+            return None
+        if len(clauses) == 1:
+            return clauses[0]
+        return {"$and": clauses}
+
     def query(
         self,
         question        : str,
         top_k           : int = 5,
-        modality_filter : str | None = None,
+        modality_filter : str | list[str] | None = None,
+        source_filter   : str | list[str] | None = None,
+        date_from_ts    : int | None = None,
+        date_to_ts      : int | None = None,
         chat_history    : list[dict] | None = None,
     ) -> dict:
         """
@@ -1080,8 +1172,14 @@ provided source chunks. Follow these rules:
         ----------
         question        : str           The user's natural language question.
         top_k           : int           Final number of chunks to pass to the LLM.
-        modality_filter : str | None    Optional filter: "Document" | "Audio" |
-                                        "Image" | "Video" | "Code"
+        modality_filter : str | list    Optional. One or more of: "Document",
+                                        "Audio", "Image", "Video", "Code".
+        source_filter   : str | list    Optional. Restrict to specific source
+                                        filenames (e.g. ["report.pdf"]).
+        date_from_ts    : int | None    Optional. Only chunks indexed at or
+                                        after this Unix timestamp.
+        date_to_ts      : int | None    Optional. Only chunks indexed at or
+                                        before this Unix timestamp.
         chat_history    : list[dict]    Prior turns for multi-turn retrieval, each
                                         {"role": ..., "content": ...}. Should NOT
                                         include the current question. When provided,
@@ -1115,8 +1213,17 @@ provided source chunks. Follow these rules:
         # ── Step 1: Embed the (rewritten) query ───────────────────────────
         query_embedding = self._embedder.embed(search_query)
 
+        # Combined metadata filter (modality / source / date range). Dense
+        # retrieval uses this natively; for BM25 we filter the IDs after
+        # retrieval since rank_bm25 has no concept of metadata.
+        where = self._build_where_filter(
+            modality_filter=modality_filter,
+            source_filter=source_filter,
+            date_from_ts=date_from_ts,
+            date_to_ts=date_to_ts,
+        )
+
         # ── Step 2: Dense retrieval (ChromaDB) ───────────────────────────
-        where = {"modality": modality_filter} if modality_filter else None
         dense_results = self._chroma.query(
             embedding=query_embedding,
             top_k=top_k * 2,     # over-retrieve for RRF fusion
@@ -1124,7 +1231,21 @@ provided source chunks. Follow these rules:
         )
 
         # ── Step 3: Sparse retrieval (BM25) ──────────────────────────────
-        sparse_results = self._bm25.query(search_query, top_k=top_k * 2)
+        # Over-retrieve generously when filtering so the surviving set is
+        # still rich enough for RRF fusion + reranking.
+        sparse_pool = top_k * 4 if where else top_k * 2
+        sparse_results = self._bm25.query(search_query, top_k=sparse_pool)
+
+        # Apply the same metadata filter to BM25 results via ChromaDB lookup.
+        if where and sparse_results:
+            allowed = set(self._chroma.filter_ids(
+                [r["id"] for r in sparse_results], where
+            ))
+            sparse_results = [r for r in sparse_results if r["id"] in allowed]
+            # Renumber ranks after filtering so RRF stays consistent.
+            for i, r in enumerate(sparse_results[:top_k * 2], 1):
+                r["rank"] = i
+            sparse_results = sparse_results[:top_k * 2]
 
         # ── Step 4: Hybrid fusion (RRF) ───────────────────────────────────
         fused = self._retriever.fuse(
@@ -1193,7 +1314,7 @@ provided source chunks. Follow these rules:
             f"{context_block}\n\n"
             f"---\n\n"
             f"Question: {question}\n\n"
-            f"Answer (cite sources using [Source: filename]):"
+            f"Answer (cite each claim with [N] matching the chunk numbers above):"
         )
 
         # Assemble the message list: system prompt, recent history, then the
@@ -1236,6 +1357,14 @@ provided source chunks. Follow these rules:
             "chroma_docs": self._chroma.count,
             "bm25_docs"  : self._bm25.count,
         }
+
+    def list_sources(self) -> list[str]:
+        """Return all distinct source filenames in the index (for UI filters)."""
+        return self._chroma.list_distinct("source")
+
+    def list_modalities(self) -> list[str]:
+        """Return all distinct modalities in the index (for UI filters)."""
+        return self._chroma.list_distinct("modality")
 
     def delete_source(self, source_filename: str) -> dict:
         """Remove all chunks from a specific source file."""

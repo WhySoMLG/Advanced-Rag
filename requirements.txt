@@ -1,10 +1,17 @@
 # Web Framework
+# Used for the chat UI and the sidebar metadata-filter widgets
+# (multiselect for modality/source, date_input for indexed-date range).
 streamlit
 
 # Local LLM Integration
+# Drives chunking, contextual retrieval, query rewriting (multi-turn),
+# and answer generation — all locally via Ollama.
 ollama
 
 # Vector Database & Retrieval
+# ChromaDB stores per-chunk metadata (source, modality, indexed_at,
+# indexed_ts) and is queried with $and / $in / $gte / $lte for the
+# UI metadata filters.
 chromadb
 rank_bm25
 
