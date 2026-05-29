@@ -220,8 +220,6 @@ A single named volume **`rag_data`** holds the ChromaDB, BM25 index, memory JSON
 
 **Want fully self-contained Docker (no host Ollama)?** The compose file has a commented-out `ollama` + `ollama-pull` section you can enable — costs ~10 GB extra Docker disk.
 
-**Do you need Kubernetes?** Short answer: **no.** Kubernetes makes sense when you have multiple nodes, want auto-scaling, rolling updates, or service-mesh observability for a fleet of services. For a single-machine local RAG with three containers and one user, K8s adds an order of magnitude of complexity (kubelet, etcd, ingress controllers, manifests) with zero functional benefit. Stick with Docker Compose. If you ever did want it (e.g. deploying to a managed cluster for a team), you'd convert each compose service to a `Deployment` + `Service` + `PersistentVolumeClaim` — but a real reason to do that is unlikely on a laptop.
-
 ---
 
 ## 📖 Using the App
@@ -497,7 +495,7 @@ tailwindcss ^3.4    typescript ^5.5
 - [x] Support for web URL ingestion
 - [x] Full UI overhaul (FastAPI + Next.js + Tailwind, 3-tab layout)
 - [x] Persistent memory & custom prompts
-- [ ] Docker Compose setup for one-command deployment
+- [x] Docker Compose setup for one-command deployment
 - [ ] Page-number / timestamp granularity in citations (PDF pages, video timestamps)
 - [ ] Streaming token-by-token chat responses
 
