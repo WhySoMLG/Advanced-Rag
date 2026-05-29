@@ -774,7 +774,115 @@ class HybridRetriever:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  6. RAG CONNECTOR  (top-level façade)
+#  6. QUERY REWRITER  (conversational / multi-turn retrieval)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class QueryRewriter:
+    """
+    Rewrites a follow-up question into a self-contained, standalone search query
+    using the conversation history.
+
+    WHY THIS MATTERS
+    ────────────────
+    In a multi-turn chat, follow-up questions are full of references that only
+    make sense given the previous turns:
+
+        User: "What were Acme's Q3 revenue drivers?"
+        Bot : "Cloud services and enterprise licensing…"
+        User: "And how did THAT compare to Q2?"   ← "that" = revenue drivers
+
+    Embedding "And how did that compare to Q2?" retrieves almost nothing useful —
+    the pronoun carries no semantic signal. The rewriter resolves the references
+    against history first, producing a query the retriever can actually match:
+
+        "How did Acme's Q3 revenue drivers (cloud services and enterprise
+         licensing) compare to Q2?"
+
+    This is the standard "condense question" / history-aware retrieval pattern.
+    Retrieval uses the rewritten query; the LLM still answers the user's original
+    phrasing, with recent history supplied for natural, coherent replies.
+
+    Uses the same local Llama 3 model as generation — no extra dependencies.
+    """
+
+    MODEL = "llama3"
+
+    #: How many of the most recent messages to feed the rewriter.
+    DEFAULT_HISTORY_TURNS = 6
+
+    SYSTEM_PROMPT = (
+        "You rewrite a user's latest message into a single, fully self-contained "
+        "search query for a retrieval system.\n\n"
+        "RULES:\n"
+        "- Resolve all pronouns and references (it, that, they, the previous one) "
+        "using the conversation history.\n"
+        "- Preserve the original intent. Do NOT answer the question.\n"
+        "- If the latest message is already self-contained, return it unchanged.\n"
+        "- Output ONLY the rewritten query — no preamble, labels, or quotation marks."
+    )
+
+    def __init__(self, model: str = MODEL, history_turns: int = DEFAULT_HISTORY_TURNS) -> None:
+        self._model         = model
+        self._history_turns = history_turns
+
+    def rewrite(self, question: str, chat_history: list[dict] | None) -> str:
+        """
+        Produce a standalone query from *question* + *chat_history*.
+
+        Parameters
+        ----------
+        question     : str
+            The user's latest (possibly elliptical) question.
+        chat_history : list[dict] | None
+            Prior messages, each {"role": "user"|"assistant", "content": str}.
+            Should NOT include the current question.
+
+        Returns
+        -------
+        str
+            The rewritten standalone query, or the original question unchanged
+            if there is no history or rewriting fails.
+        """
+        # No history → nothing to resolve; return as-is.
+        if not chat_history:
+            return question
+
+        import ollama  # type: ignore
+
+        # Build a compact transcript from the most recent turns.
+        recent = chat_history[-self._history_turns:]
+        transcript = "\n".join(
+            f"{m['role'].capitalize()}: {m['content']}" for m in recent
+        )
+
+        user_message = (
+            f"Conversation history:\n{transcript}\n\n"
+            f"Latest message: {question}\n\n"
+            f"Rewritten standalone query:"
+        )
+
+        try:
+            response = ollama.chat(
+                model=self._model,
+                messages=[
+                    {"role": "system", "content": self.SYSTEM_PROMPT},
+                    {"role": "user",   "content": user_message},
+                ],
+                options={"temperature": 0.0, "num_ctx": 4096},
+            )
+            rewritten = response["message"]["content"].strip().strip('"')
+            # Guard against the model returning an empty string or refusing.
+            if rewritten:
+                logger.info("[QueryRewriter] '%s' → '%s'", question[:50], rewritten[:50])
+                return rewritten
+        except Exception as exc:
+            logger.warning("[QueryRewriter] Rewrite failed (%s) — using original.", exc)
+
+        return question
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  7. RAG CONNECTOR  (top-level façade)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class RAGConnector:
@@ -801,6 +909,10 @@ class RAGConnector:
     """
 
     GENERATION_MODEL = "llama3"
+
+    #: How many recent chat messages to include in the generation prompt
+    #: for conversational coherence (keeps the context window manageable).
+    HISTORY_TURNS_IN_PROMPT = 4
 
     # System prompt for the final answer generation step
     GENERATION_SYSTEM_PROMPT = """\
@@ -856,6 +968,7 @@ provided source chunks. Follow these rules:
             if use_reranker
             else None
         )
+        self._rewriter   = QueryRewriter(model=generation_model)
         self._gen_model  = generation_model
 
         logger.info(
@@ -958,6 +1071,7 @@ provided source chunks. Follow these rules:
         question        : str,
         top_k           : int = 5,
         modality_filter : str | None = None,
+        chat_history    : list[dict] | None = None,
     ) -> dict:
         """
         Retrieve relevant chunks and generate an answer.
@@ -968,25 +1082,38 @@ provided source chunks. Follow these rules:
         top_k           : int           Final number of chunks to pass to the LLM.
         modality_filter : str | None    Optional filter: "Document" | "Audio" |
                                         "Image" | "Video" | "Code"
+        chat_history    : list[dict]    Prior turns for multi-turn retrieval, each
+                                        {"role": ..., "content": ...}. Should NOT
+                                        include the current question. When provided,
+                                        the question is rewritten into a standalone
+                                        query before retrieval, and recent history
+                                        is given to the LLM for coherent answers.
 
         Returns
         -------
         dict with keys:
-          "answer"  : str          LLM-generated answer grounded in the chunks.
-          "sources" : list[dict]   The top-k chunks used (with metadata).
-          "question": str          Echo of the original question.
+          "answer"           : str          LLM-generated answer grounded in the chunks.
+          "sources"          : list[dict]   The top-k chunks used (with metadata).
+          "question"         : str          Echo of the original question.
+          "search_query"     : str          The (possibly rewritten) query used for retrieval.
         """
         logger.info("[RAGConnector] Query: '%s'", question[:80])
 
         if self._chroma.count == 0:
             return {
-                "answer"  : "The knowledge base is empty. Please index some files first.",
-                "sources" : [],
-                "question": question,
+                "answer"      : "The knowledge base is empty. Please index some files first.",
+                "sources"     : [],
+                "question"    : question,
+                "search_query": question,
             }
 
-        # ── Step 1: Embed the question ────────────────────────────────────
-        query_embedding = self._embedder.embed(question)
+        # ── Step 0: Rewrite the question for retrieval (multi-turn) ───────
+        # Resolves pronouns/references against chat history so follow-ups
+        # like "how does that compare to Q2?" retrieve the right chunks.
+        search_query = self._rewriter.rewrite(question, chat_history)
+
+        # ── Step 1: Embed the (rewritten) query ───────────────────────────
+        query_embedding = self._embedder.embed(search_query)
 
         # ── Step 2: Dense retrieval (ChromaDB) ───────────────────────────
         where = {"modality": modality_filter} if modality_filter else None
@@ -997,7 +1124,7 @@ provided source chunks. Follow these rules:
         )
 
         # ── Step 3: Sparse retrieval (BM25) ──────────────────────────────
-        sparse_results = self._bm25.query(question, top_k=top_k * 2)
+        sparse_results = self._bm25.query(search_query, top_k=top_k * 2)
 
         # ── Step 4: Hybrid fusion (RRF) ───────────────────────────────────
         fused = self._retriever.fuse(
@@ -1009,7 +1136,7 @@ provided source chunks. Follow these rules:
 
         # ── Step 5: Optional reranking (cross-encoder) ─────────────────────
         if self._reranker:
-            fused = self._reranker.rerank(question, fused, top_k=top_k)
+            fused = self._reranker.rerank(search_query, fused, top_k=top_k)
 
         logger.info(
             "[RAGConnector] Retrieval: %d dense | %d sparse | %d fused" +
@@ -1020,24 +1147,32 @@ provided source chunks. Follow these rules:
         )
 
         # ── Step 6: Generate answer via llama3 ───────────────────────────
-        answer = self._generate(question, fused)
+        # Answer the user's ORIGINAL phrasing, with recent history for coherence.
+        answer = self._generate(question, fused, chat_history=chat_history)
 
         return {
-            "answer"  : answer,
-            "sources" : fused,
-            "question": question,
+            "answer"      : answer,
+            "sources"     : fused,
+            "question"    : question,
+            "search_query": search_query,
         }
 
     # ── GENERATION ────────────────────────────────────────────────────────────
 
-    def _generate(self, question: str, chunks: list[dict]) -> str:
+    def _generate(
+        self,
+        question: str,
+        chunks: list[dict],
+        chat_history: list[dict] | None = None,
+    ) -> str:
         """
         Build a grounded prompt from retrieved chunks and call llama3 to
         generate a final answer.
 
         The prompt structure follows the RAG pattern:
-          SYSTEM: instructions + grounding rules
-          USER:   retrieved context + question
+          SYSTEM:    instructions + grounding rules
+          HISTORY:   recent prior turns (optional, for conversational coherence)
+          USER:      retrieved context + question
         """
         import ollama  # type: ignore
 
@@ -1061,13 +1196,23 @@ provided source chunks. Follow these rules:
             f"Answer (cite sources using [Source: filename]):"
         )
 
+        # Assemble the message list: system prompt, recent history, then the
+        # grounded user turn. History gives the model conversational context
+        # while the source chunks keep the answer grounded.
+        messages: list[dict] = [
+            {"role": "system", "content": self.GENERATION_SYSTEM_PROMPT}
+        ]
+        if chat_history:
+            for m in chat_history[-self.HISTORY_TURNS_IN_PROMPT:]:
+                role = m.get("role")
+                if role in ("user", "assistant") and m.get("content"):
+                    messages.append({"role": role, "content": str(m["content"])})
+        messages.append({"role": "user", "content": user_message})
+
         try:
             response = ollama.chat(
                 model=self._gen_model,
-                messages=[
-                    {"role": "system", "content": self.GENERATION_SYSTEM_PROMPT},
-                    {"role": "user",   "content": user_message},
-                ],
+                messages=messages,
                 options={
                     "temperature": 0.2,   # low temperature for factual answers
                     "num_ctx"    : 8192,
