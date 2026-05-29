@@ -1,0 +1,124 @@
+# ═════════════════════════════════════════════════════════════════════════════
+#  Advanced RAG — one-line deployment
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# Usage:
+#     docker compose up -d         # start everything in the background
+#     docker compose logs -f       # follow logs
+#     docker compose down          # stop (data is preserved in named volumes)
+#     docker compose down -v       # stop AND wipe the index / memory
+#
+# Default setup:
+#   • Two containers: backend (FastAPI) + frontend (Next.js).
+#   • Ollama is expected to be running ON THE HOST at :11434.
+#     The backend talks to it via host.docker.internal.
+#
+# Why not bundle Ollama? Because:
+#   • The ollama/ollama image is 2+ GB before any models are pulled.
+#   • Models (llama3 ~4.7 GB, llava ~4.7 GB, nomic-embed ~274 MB) would have
+#     to re-download into a Docker volume even though they almost certainly
+#     already exist on your host. Total wasted disk: ~10 GB.
+#   • A single-machine dev/local stack doesn't benefit from isolating Ollama.
+#
+# If you DO want fully self-contained Docker (no host Ollama needed), see the
+# commented-out section at the bottom of this file.
+#
+# Browser: http://localhost:3000
+# ═════════════════════════════════════════════════════════════════════════════
+
+services:
+
+  # ── FastAPI backend (RAG pipeline + chat + ingest + memory) ───────────────
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag_backend
+    restart: unless-stopped
+    environment:
+      # Talk to the host's Ollama. On macOS / Windows Docker Desktop,
+      # host.docker.internal resolves to the host. On Linux, add
+      # `extra_hosts: ["host.docker.internal:host-gateway"]` (uncommented below).
+      OLLAMA_HOST: http://host.docker.internal:11434
+      # Cross-encoder reranker — enabled per your request.
+      RAG_USE_RERANKER: "true"
+      # All persistent state goes here (mounted as a named volume below).
+      RAG_DATA_DIR: /data
+      # Cache directory for the reranker model so it isn't re-downloaded
+      # on every container rebuild.
+      HF_HOME: /data/hf_cache
+    extra_hosts:
+      # Required on Linux; harmless on macOS / Windows.
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - rag_data:/data
+    ports:
+      # Exposed for debugging / direct API access; not required for the UI.
+      - "8000:8000"
+
+  # ── Next.js frontend ──────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: rag_frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      # Used by next.config.js to proxy /api/* to the backend container.
+      BACKEND_URL: http://backend:8000
+    ports:
+      - "3000:3000"
+
+
+# ── Persistent storage ─────────────────────────────────────────────────────
+# A single named volume survives `docker compose down`:
+#   • rag_data : chroma_db/, bm25_index.json, memory.json, HF reranker cache
+volumes:
+  rag_data:
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  OPTIONAL — fully self-contained stack (bundled Ollama)
+# ═════════════════════════════════════════════════════════════════════════════
+# Use this if you don't want to install Ollama on the host. You'll need ~10 GB
+# of extra Docker disk for the models.
+#
+# Steps:
+#   1. Uncomment the two services below.
+#   2. In the `backend` service above, replace
+#        OLLAMA_HOST: http://host.docker.internal:11434
+#      with
+#        OLLAMA_HOST: http://ollama:11434
+#      and add `depends_on: { ollama: { condition: service_healthy } }`.
+#   3. Add a third volume below: `ollama_models:`
+#
+#   ollama:
+#     image: ollama/ollama:latest
+#     container_name: rag_ollama
+#     restart: unless-stopped
+#     volumes:
+#       - ollama_models:/root/.ollama
+#     ports:
+#       - "11434:11434"
+#     healthcheck:
+#       test: ["CMD", "ollama", "list"]
+#       interval: 10s
+#       timeout: 5s
+#       retries: 12
+#
+#   ollama-pull:
+#     # One-shot: pulls llama3 + llava + nomic-embed-text on first start.
+#     image: ollama/ollama:latest
+#     depends_on:
+#       ollama:
+#         condition: service_healthy
+#     environment:
+#       OLLAMA_HOST: http://ollama:11434
+#     entrypoint:
+#       - /bin/sh
+#       - -c
+#       - "ollama pull llama3 && ollama pull llava && ollama pull nomic-embed-text"
+#     restart: "no"

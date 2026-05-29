@@ -19,7 +19,8 @@ No OpenAI API keys. No cloud services. Everything runs on your machine via [Olla
 - **Web URL ingestion** — paste any article URL; `trafilatura` extracts clean main-content Markdown which flows through the same chunking → contextualisation → indexing pipeline as files
 - **Persistent memory & prompts** — a user-controlled system prompt + a list of "standing facts" notes that get injected into every answer (no re-indexing needed)
 - **Fully local LLMs** — Llama 3 for chunking, context generation, and answering; LLaVA for image understanding; Whisper for transcription
-- **Tabbed Next.js + Tailwind UI** — Chat / Knowledge Base / Memory tabs against a FastAPI backend. A legacy single-process Streamlit UI is also kept as a no-Node-required fallback.
+- **Tabbed Next.js + Tailwind UI** — Chat / Knowledge Base / Memory tabs against a FastAPI backend
+- **One-line Docker deployment** — `docker compose up -d` brings up both containers; talks to your host's Ollama by default to avoid re-downloading models
 - **Persistent indexes** — ChromaDB and BM25 survive restarts; re-indexing a file automatically deduplicates
 
 ---
@@ -186,15 +187,40 @@ npm run build && npm start
 | Ingest crashes on a long document | Was the LLM chunker; not the default anymore | Make sure `chunker_strategy="markdown"` (the default) — only an issue if you explicitly opted into `"llm"` |
 | Reranker import error | `sentence-transformers` not installed | `pip install sentence-transformers` |
 
-### Legacy Streamlit UI (alternative)
+### 🐳 Docker — one-line deployment
 
-The original single-process Streamlit UI still works if you don't want to install Node:
+A `docker-compose.yml` is included that runs the backend and frontend in separate containers. The default setup talks to your **host's** Ollama (avoids re-downloading 10 GB of models inside Docker), so make sure `ollama serve` is running and the three models are pulled on the host first.
 
 ```bash
-streamlit run app.py
+# Make sure host Ollama is up + models are pulled
+ollama serve &
+ollama pull llama3 && ollama pull llava && ollama pull nomic-embed-text
+
+# One line, everything starts
+docker compose up -d
+
+# Watch logs
+docker compose logs -f
+
+# Stop (data preserved in the rag_data named volume)
+docker compose down
+
+# Stop AND wipe the index / memory / reranker cache
+docker compose down -v
 ```
 
-Opens at <http://localhost:8501>. It has all the same retrieval features but a simpler look and no separate Memory tab.
+Then open **<http://localhost:3000>**.
+
+| Container | Role | Image size |
+|-----------|------|------------|
+| `rag_backend` | FastAPI + RAG pipeline | ~5 GB (torch, whisper, docling, sentence-transformers) |
+| `rag_frontend` | Next.js 14 standalone production build | ~180 MB |
+
+A single named volume **`rag_data`** holds the ChromaDB, BM25 index, memory JSON, and Hugging Face reranker cache. The first build takes 5–10 minutes; subsequent rebuilds are seconds thanks to layer caching.
+
+**Want fully self-contained Docker (no host Ollama)?** The compose file has a commented-out `ollama` + `ollama-pull` section you can enable — costs ~10 GB extra Docker disk.
+
+**Do you need Kubernetes?** Short answer: **no.** Kubernetes makes sense when you have multiple nodes, want auto-scaling, rolling updates, or service-mesh observability for a fleet of services. For a single-machine local RAG with three containers and one user, K8s adds an order of magnitude of complexity (kubelet, etcd, ingress controllers, manifests) with zero functional benefit. Stick with Docker Compose. If you ever did want it (e.g. deploying to a managed cluster for a team), you'd convert each compose service to a `Deployment` + `Service` + `PersistentVolumeClaim` — but a real reason to do that is unlikely on a laptop.
 
 ---
 
@@ -289,8 +315,10 @@ python multimodal_rag_pipeline.py diagram.png out.json --no-context
 │   ├── ChunkingAgent           # Legacy LLM chunker (opt-in: chunker_strategy="llm")
 │   ├── ContextualRetriever     # Parallel context enrichment via Llama 3
 │   └── MultimodalRAGPipeline   # High-level orchestrator (ingest + ingest_url)
-├── app.py                      # Legacy Streamlit UI (still works)
+├── Dockerfile                  # Backend image (FastAPI + RAG pipeline)
+├── docker-compose.yml          # One-line deployment for backend + frontend
 ├── frontend/                   # Next.js 14 + TypeScript + Tailwind UI
+│   └── Dockerfile              # Standalone production image
 │   ├── app/page.tsx            # 3-tab shell
 │   ├── app/components/         # ChatTab · KnowledgeBaseTab · MemoryTab
 │   ├── lib/api.ts              # Typed client for the FastAPI backend

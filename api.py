@@ -44,9 +44,22 @@ logger = logging.getLogger("api")
 
 # ── Single shared instances ─────────────────────────────────────────────────
 # The connector is heavy (loads Ollama/Chroma/BM25); we want exactly one.
+#
+# All persisted state lives under RAG_DATA_DIR (default: project root).
+# In Docker we set this to /data and mount a single named volume — that way
+# Chroma, BM25, and the memory JSON all survive container restarts together.
 USE_RERANKER = os.environ.get("RAG_USE_RERANKER", "false").lower() == "true"
-rag    = RAGConnector(use_reranker=USE_RERANKER)
-memory = MemoryStore()
+DATA_DIR     = Path(os.environ.get("RAG_DATA_DIR", ".")).resolve()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+rag    = RAGConnector(
+    use_reranker      = USE_RERANKER,
+    chroma_persist_dir= str(DATA_DIR / "chroma_db"),
+    bm25_persist_path = str(DATA_DIR / "bm25_index.json"),
+)
+memory = MemoryStore(persist_path=str(DATA_DIR / "memory.json"))
+
+logger.info("RAG_DATA_DIR = %s | reranker = %s", DATA_DIR, USE_RERANKER)
 
 # ── App + CORS ──────────────────────────────────────────────────────────────
 app = FastAPI(title="Advanced RAG API", version="2.0.0")

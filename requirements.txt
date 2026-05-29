@@ -1,10 +1,8 @@
-# Web Framework
-# FastAPI now powers the backend; the React/Next frontend lives in ./frontend
-# and talks to this server over JSON. Streamlit is kept as a legacy/fallback UI.
+# Web Framework — FastAPI backend
+# The React/Next frontend lives in ./frontend and talks to this server over JSON.
 fastapi
 uvicorn[standard]
 python-multipart
-streamlit
 
 # Local LLM Integration
 # Drives chunking, contextual retrieval, query rewriting (multi-turn),
@@ -19,7 +17,12 @@ chromadb
 rank_bm25
 
 # Cross-Encoder Reranker (optional — enable with RAGConnector(use_reranker=True))
-sentence-transformers
+# Versions are pinned to a known-good combination:
+#   • transformers 5.x reorganised internal modules and breaks sentence-transformers
+#   • sentence-transformers 5.x + recent accelerate trigger a "meta tensor" load
+#     error on CPU. The 3.x line is the last stable family for CrossEncoder on CPU.
+transformers>=4.40,<5
+sentence-transformers>=3.0,<4
 
 # Web URL Ingestion
 # httpx fetches pages; trafilatura strips boilerplate and returns clean Markdown.

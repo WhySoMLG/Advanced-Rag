@@ -1,0 +1,25 @@
+# Keep the backend build context small + fast.
+
+# Python local env
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Persisted data (must live in a volume, not the image)
+chroma_db/
+bm25_index.json
+memory.json
+
+# Frontend (built in its own image)
+frontend/
+
+# Docker / git / misc
+.git/
+.gitignore
+.dockerignore
+Dockerfile
+docker-compose.yml
+*.md
+.DS_Store
+README.md
