@@ -284,7 +284,7 @@ sentence-transformers  # Cross-encoder reranker (optional)
 ## 🗺️ Roadmap
 
 - [x] Re-ranking with a cross-encoder model
-- [ ] Multi-turn / conversational retrieval (query rewriting from chat history)
+- [x] Multi-turn / conversational retrieval (query rewriting from chat history)
 - [ ] Multi-document cross-file citation
 - [ ] Metadata filtering in the UI (by modality, date, source)
 - [ ] Support for web URL ingestion
