@@ -285,8 +285,8 @@ sentence-transformers  # Cross-encoder reranker (optional)
 
 - [x] Re-ranking with a cross-encoder model
 - [x] Multi-turn / conversational retrieval (query rewriting from chat history)
-- [ ] Multi-document cross-file citation
-- [ ] Metadata filtering in the UI (by modality, date, source)
+- [x] Multi-document cross-file citation
+- [x] Metadata filtering in the UI (by modality, date, source)
 - [ ] Support for web URL ingestion
 - [ ] Docker Compose setup for one-command deployment
 
